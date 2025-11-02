@@ -126,7 +126,7 @@ jobs:
         make defconfig
         make download -j$(nproc)  # 多线程下载
         # 清理无效下载文件（小于 1KB 的文件）
-        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec ls -l {} \; 
         find dl -size -1024c -exec rm -f {} \;
         # 显示已下载文件数量，确认下载状态
         echo "已下载 $(find dl -type f | wc -l) 个包文件"
