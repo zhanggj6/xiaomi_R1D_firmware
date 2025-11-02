@@ -35,38 +35,53 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04  # 升级到长期支持的 22.04 版本
 
     steps:
     - name: Checkout
-      uses: actions/checkout@main
+      uses: actions/checkout@v4  # 使用最新版本的 checkout 动作
 
     - name: Initialization environment
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
+        # 清理不必要的预装软件，释放磁盘空间
         sudo rm -rf /etc/apt/sources.list.d/* /usr/share/dotnet /usr/local/lib/android /opt/ghc
         sudo -E apt-get -qq update
-        sudo -E apt-get -qq install $(curl -fsSL git.io/depends-ubuntu-2004)
+        # 安装依赖（使用更稳定的源链接，避免 git.io 短链接失效）
+        sudo -E apt-get -qq install $(curl -fsSL https://raw.githubusercontent.com/P3TERX/Actions-OpenWrt/master/depends-ubuntu-2204)
         sudo -E apt-get -qq autoremove --purge
         sudo -E apt-get -qq clean
         sudo timedatectl set-timezone "$TZ"
+        # 创建工作目录并设置权限
         sudo mkdir -p /workdir
         sudo chown $USER:$GROUPS /workdir
+        # 额外清理，释放更多空间
+        sudo rm -rf /var/lib/apt/lists/*
 
     - name: Clone source code
       working-directory: /workdir
       run: |
-        df -hT $PWD
-        git clone $REPO_URL -b $REPO_BRANCH openwrt
+        df -hT $PWD  # 显示磁盘空间使用情况
+        git clone --depth 1 $REPO_URL -b $REPO_BRANCH openwrt  # 浅克隆加速
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
     - name: Load custom feeds
       run: |
-        [ -e $FEEDS_CONF ] && mv $FEEDS_CONF openwrt/feeds.conf.default
-        chmod +x $DIY_P1_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P1_SH
+        if [ -e "$FEEDS_CONF" ]; then
+          mv "$FEEDS_CONF" openwrt/feeds.conf.default
+          echo "已加载自定义 feeds 配置: $FEEDS_CONF"
+        else
+          echo "未找到自定义 feeds 配置，使用默认配置"
+        fi
+        if [ -e "$DIY_P1_SH" ]; then
+          chmod +x "$DIY_P1_SH"
+          cd openwrt
+          "$GITHUB_WORKSPACE/$DIY_P1_SH"
+          echo "已执行自定义脚本: $DIY_P1_SH"
+        else
+          echo "未找到自定义脚本 $DIY_P1_SH，跳过执行"
+        fi
 
     - name: Update feeds
       run: cd openwrt && ./scripts/feeds update -a
@@ -76,15 +91,30 @@ jobs:
 
     - name: Load custom configuration
       run: |
-        [ -e files ] && mv files openwrt/files
-        [ -e $CONFIG_FILE ] && mv $CONFIG_FILE openwrt/.config
-        chmod +x $DIY_P2_SH
-        cd openwrt
-        $GITHUB_WORKSPACE/$DIY_P2_SH
+        if [ -d "files" ]; then
+          mv files openwrt/files
+          echo "已加载自定义文件目录: files"
+        else
+          echo "未找到自定义文件目录，跳过"
+        fi
+        if [ -e "$CONFIG_FILE" ]; then
+          mv "$CONFIG_FILE" openwrt/.config
+          echo "已加载自定义配置: $CONFIG_FILE"
+        else
+          echo "未找到自定义配置，使用默认配置"
+        fi
+        if [ -e "$DIY_P2_SH" ]; then
+          chmod +x "$DIY_P2_SH"
+          cd openwrt
+          "$GITHUB_WORKSPACE/$DIY_P2_SH"
+          echo "已执行自定义脚本: $DIY_P2_SH"
+        else
+          echo "未找到自定义脚本 $DIY_P2_SH，跳过执行"
+        fi
 
     - name: SSH connection to Actions
       uses: P3TERX/ssh2actions@v1.0.0
-      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+      if: github.event.inputs.ssh == 'true' || contains(github.event.action, 'ssh')  # 简化条件判断
       env:
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -94,47 +124,63 @@ jobs:
       run: |
         cd openwrt
         make defconfig
-        make download -j8
+        make download -j$(nproc)  # 多线程下载
+        # 清理无效下载文件（小于 1KB 的文件）
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
+        # 显示已下载文件数量，确认下载状态
+        echo "已下载 $(find dl -type f | wc -l) 个包文件"
 
     - name: Compile the firmware
       id: compile
       run: |
         cd openwrt
-        echo -e "$(nproc) thread compile"
-        make -j$(nproc) || make -j1 || make -j1 V=s
+        # 合理控制线程数（避免资源耗尽，使用 CPU 核心数的一半）
+        CORES=$(nproc)
+        COMPILE_JOBS=$((CORES > 2 ? CORES / 2 : 1))
+        echo "使用 $COMPILE_JOBS 线程编译"
+        # 编译重试逻辑（先多线程，失败则单线程带日志）
+        make -j$COMPILE_JOBS || make -j1 || make -j1 V=s
         echo "::set-output name=status::success"
+        # 提取设备名称
         grep '^CONFIG_TARGET.*DEVICE.*=y' .config | sed -r 's/.*DEVICE_(.*)=y/\1/' > DEVICE_NAME
-        [ -s DEVICE_NAME ] && echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+        if [ -s DEVICE_NAME ]; then
+          echo "DEVICE_NAME=_$(cat DEVICE_NAME)" >> $GITHUB_ENV
+          echo "设备名称: $(cat DEVICE_NAME)"
+        else
+          echo "未识别设备名称，使用默认命名"
+        fi
         echo "FILE_DATE=_$(date +"%Y%m%d%H%M")" >> $GITHUB_ENV
 
     - name: Check space usage
-      if: (!cancelled())
+      if: !cancelled()
       run: df -hT
 
     - name: Upload bin directory
-      uses: actions/upload-artifact@main
+      uses: actions/upload-artifact@v4  # 使用最新版本的上传动作
       if: steps.compile.outputs.status == 'success' && env.UPLOAD_BIN_DIR == 'true'
       with:
         name: OpenWrt_bin${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: openwrt/bin
+        retention-days: 7  # 限制工件保存时间（7天）
 
     - name: Organize files
       id: organize
       if: env.UPLOAD_FIRMWARE == 'true' && !cancelled()
       run: |
         cd openwrt/bin/targets/*/*
-        rm -rf packages
+        rm -rf packages  # 移除冗余的 packages 目录
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "固件目录: $PWD"
         echo "::set-output name=status::success"
 
     - name: Upload firmware directory
-      uses: actions/upload-artifact@main
+      uses: actions/upload-artifact@v4
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
         name: OpenWrt_firmware${{ env.DEVICE_NAME }}${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
+        retention-days: 30  # 固件保留30天
 
     - name: Upload firmware to cowtransfer
       id: cowtransfer
@@ -165,7 +211,7 @@ jobs:
         echo "::set-output name=status::success"
 
     - name: Upload firmware to release
-      uses: softprops/action-gh-release@v1
+      uses: softprops/action-gh-release@v2  # 使用最新版本的 release 动作
       if: steps.tag.outputs.status == 'success' && !cancelled()
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -174,14 +220,14 @@ jobs:
         body_path: release.txt
         files: ${{ env.FIRMWARE }}/*
 
-    - name: Delete workflow runs
+    - name: Delete old workflow runs
       uses: GitRML/delete-workflow-runs@main
       with:
-        retain_days: 1
+        retain_days: 3  # 保留3天的工作流记录（便于调试）
         keep_minimum_runs: 3
 
     - name: Remove old Releases
-      uses: dev-drprasad/delete-older-releases@v0.1.0
+      uses: dev-drprasad/delete-older-releases@v0.2.0  # 使用较新的版本
       if: env.UPLOAD_RELEASE == 'true' && !cancelled()
       with:
         keep_latest: 3
